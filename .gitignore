@@ -1,1 +1,5 @@
-./similarity.ipynb
+similarity.ipynb
+.env
+*.env
+.env.*
+

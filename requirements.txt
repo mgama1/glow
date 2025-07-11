@@ -1,0 +1,8 @@
+streamlit
+firebase-admin
+python-dotenv
+pandas
+numpy
+Pillow
+imagehash
+
