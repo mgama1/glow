@@ -95,7 +95,6 @@ def calculate_hashes(image):
     except Exception as e:
         st.error(f"Error calculating hashes: {str(e)}")
         return None, None, None
-"The compressed thumbnails should be small enough for the Spark tier while maintaining enough detail for perceptual hashing to work effectively." are you hashing and storing AFTER compression??
 def save_to_firestore(db, image_base64, price, phash, dhash, whash, original_filename):
     """Save image data to Firestore"""
     try:
