@@ -11,6 +11,7 @@ from datetime import datetime
 import uuid
 import os
 from dotenv import load_dotenv
+import hashlib
 
 # Page configuration
 st.set_page_config(
@@ -55,9 +56,21 @@ def init_firebase():
             "client_x509_cert_url": get_secret("FIREBASE_CLIENT_CERT_URL")
         })
 
-
         firebase_admin.initialize_app(cred)
         return firestore.client()
+
+def calculate_cryptographic_hash(image_bytes):
+    """Calculate SHA-256 hash of image bytes for duplicate detection"""
+    return hashlib.sha256(image_bytes).hexdigest()
+
+def image_to_bytes(image):
+    """Convert PIL Image to bytes for hashing"""
+    buffer = io.BytesIO()
+    # Save in a consistent format for hashing
+    if image.mode in ('RGBA', 'P'):
+        image = image.convert('RGB')
+    image.save(buffer, format='PNG')
+    return buffer.getvalue()
 
 def compress_image_to_base64(image, max_size=256, quality=100):
     """Compress image and convert to base64"""
@@ -95,7 +108,36 @@ def calculate_hashes(image):
     except Exception as e:
         st.error(f"Error calculating hashes: {str(e)}")
         return None, None, None
-def save_to_firestore(db, image_base64, price, phash, dhash, whash, original_filename):
+
+def check_duplicate_image(db, crypto_hash):
+    """Check if an image with the same cryptographic hash already exists"""
+    try:
+        # Query for documents with the same crypto_hash
+        docs = db.collection('images').where('crypto_hash', '==', crypto_hash).limit(1).stream()
+        
+        for doc in docs:
+            return doc.to_dict(), doc.id
+        
+        return None, None
+    except Exception as e:
+        st.error(f"Error checking for duplicates: {str(e)}")
+        return None, None
+
+def update_price_in_firestore(db, doc_id, new_price, original_filename):
+    """Update the price of an existing image in Firestore"""
+    try:
+        doc_ref = db.collection('images').document(doc_id)
+        doc_ref.update({
+            'price': new_price,
+            'last_updated': datetime.now(),
+            'updated_from_file': original_filename
+        })
+        return True
+    except Exception as e:
+        st.error(f"Error updating price in Firestore: {str(e)}")
+        return False
+
+def save_to_firestore(db, image_base64, price, phash, dhash, whash, crypto_hash, original_filename):
     """Save image data to Firestore"""
     try:
         doc_id = str(uuid.uuid4())
@@ -107,8 +149,10 @@ def save_to_firestore(db, image_base64, price, phash, dhash, whash, original_fil
             'phash': phash,
             'dhash': dhash,
             'whash': whash,
+            'crypto_hash': crypto_hash,
             'original_filename': original_filename,
             'timestamp': datetime.now(),
+            'last_updated': datetime.now(),
             'doc_id': doc_id
         })
         
@@ -133,9 +177,10 @@ def load_from_firestore(db):
         return pd.DataFrame()
 
 def process_multiple_images(uploaded_files, price, db):
-    """Process multiple images and save to Firestore"""
+    """Process multiple images and save to Firestore or update existing ones"""
     results = []
     errors = []
+    duplicates_updated = []
     
     for uploaded_file in uploaded_files:
         try:
@@ -145,11 +190,34 @@ def process_multiple_images(uploaded_files, price, db):
             # Read and open image
             image = Image.open(uploaded_file)
             
-            # Calculate hashes on original image
+            # Calculate cryptographic hash for duplicate detection
+            image_bytes = image_to_bytes(image)
+            crypto_hash = calculate_cryptographic_hash(image_bytes)
+            
+            # Check if image already exists
+            existing_doc, existing_doc_id = check_duplicate_image(db, crypto_hash)
+            
+            if existing_doc:
+                # Image already exists, update price
+                old_price = existing_doc.get('price', 0)
+                if update_price_in_firestore(db, existing_doc_id, price, uploaded_file.name):
+                    duplicates_updated.append({
+                        'file_name': uploaded_file.name,
+                        'doc_id': existing_doc_id,
+                        'old_price': old_price,
+                        'new_price': price,
+                        'crypto_hash': crypto_hash,
+                        'original_filename': existing_doc.get('original_filename', 'Unknown')
+                    })
+                else:
+                    errors.append(f"Failed to update price for duplicate image {uploaded_file.name}")
+                continue
+            
+            # New image, calculate perceptual hashes
             phash, dhash, whash = calculate_hashes(image)
             
             if not all([phash, dhash, whash]):
-                errors.append(f"Failed to calculate hashes for {uploaded_file.name}")
+                errors.append(f"Failed to calculate perceptual hashes for {uploaded_file.name}")
                 continue
             
             # Compress image to base64
@@ -157,7 +225,7 @@ def process_multiple_images(uploaded_files, price, db):
             
             # Save to Firestore
             doc_id = save_to_firestore(
-                db, image_base64, price, phash, dhash, whash, uploaded_file.name
+                db, image_base64, price, phash, dhash, whash, crypto_hash, uploaded_file.name
             )
             
             if doc_id:
@@ -167,7 +235,8 @@ def process_multiple_images(uploaded_files, price, db):
                     'image': image,
                     'phash': phash,
                     'dhash': dhash,
-                    'whash': whash
+                    'whash': whash,
+                    'crypto_hash': crypto_hash
                 })
             else:
                 errors.append(f"Failed to save {uploaded_file.name} to Firestore")
@@ -175,7 +244,7 @@ def process_multiple_images(uploaded_files, price, db):
         except Exception as e:
             errors.append(f"Error processing {uploaded_file.name}: {str(e)}")
     
-    return results, errors
+    return results, errors, duplicates_updated
 
 def hamming_distance(hash1, hash2):
     """Calculate Hamming distance between two hash strings"""
@@ -207,7 +276,9 @@ def find_similar_images(query_phash, query_dhash, query_whash, df, top_n=3):
             'phash': row['phash'],
             'dhash': row['dhash'],
             'whash': row['whash'],
+            'crypto_hash': row.get('crypto_hash', 'N/A'),
             'timestamp': row['timestamp'],
+            'last_updated': row.get('last_updated', row['timestamp']),
             'original_filename': row['original_filename'],
             'phash_distance': phash_dist,
             'dhash_distance': dhash_dist,
@@ -243,6 +314,14 @@ def render_sidebar(db):
             if 'price' in df.columns:
                 avg_price = df['price'].mean()
                 st.metric("Avg Price", f"£{avg_price:.2f}")
+            
+            # Show duplicate detection info
+            if 'crypto_hash' in df.columns:
+                unique_hashes = df['crypto_hash'].nunique()
+                total_images = len(df)
+                st.metric("Unique Images", unique_hashes)
+                if unique_hashes < total_images:
+                    st.metric("Duplicates", total_images - unique_hashes)
         
         return page
 
@@ -252,6 +331,11 @@ def render_home_page(db):
     
     st.markdown("""
     Welcome to the **GLOW STORE** Reverse image search! This tool allows you to upload multiple images, calculate their perceptual hashes, and store them in Firestore for easy retrieval and comparison.
+    
+    **✨ New Features:**
+    - **Duplicate Detection**: Automatically detects duplicate images using cryptographic hashing
+    - **Price Updates**: Updates prices for existing images instead of creating duplicates
+    - **Enhanced Tracking**: Tracks when images were last updated
     """)
     
     st.markdown(
@@ -278,21 +362,44 @@ def render_home_page(db):
             st.metric("Average Price", f"£{avg_price:.2f}")
         
         with col3:
-            unique_prices = df['price'].nunique()
-            st.metric("Unique Prices", unique_prices)
+            if 'crypto_hash' in df.columns:
+                unique_images = df['crypto_hash'].nunique()
+                st.metric("Unique Images", unique_images)
+            else:
+                unique_prices = df['price'].nunique()
+                st.metric("Unique Prices", unique_prices)
         
         with col4:
-            if 'timestamp' in df.columns:
+            if 'last_updated' in df.columns:
+                latest = df['last_updated'].max()
+                st.metric("Latest Update", str(latest)[:19])
+            elif 'timestamp' in df.columns:
                 latest = df['timestamp'].max()
                 st.metric("Latest Entry", str(latest)[:19])
             else:
                 st.metric("Latest Entry", "N/A")
         
+        # Show duplicate information if available
+        if 'crypto_hash' in df.columns:
+            total_images = len(df)
+            unique_images = df['crypto_hash'].nunique()
+            duplicates = total_images - unique_images
+            
+            if duplicates > 0:
+                st.warning(f"⚠️ Found {duplicates} duplicate image(s) in database. Use the upload feature to update prices.")
+        
         # Recent additions
-        st.subheader("🕒 Recent Additions")
-        recent_df = df.sort_values('timestamp', ascending=False).head(5)
-        display_df = recent_df[['original_filename', 'price', 'timestamp']].copy()
-        display_df['timestamp'] = display_df['timestamp'].astype(str).str[:19]
+        st.subheader("🕒 Recent Activity")
+        if 'last_updated' in df.columns:
+            recent_df = df.sort_values('last_updated', ascending=False).head(5)
+            display_df = recent_df[['original_filename', 'price', 'last_updated']].copy()
+            display_df['last_updated'] = display_df['last_updated'].astype(str).str[:19]
+            display_df = display_df.rename(columns={'last_updated': 'last_activity'})
+        else:
+            recent_df = df.sort_values('timestamp', ascending=False).head(5)
+            display_df = recent_df[['original_filename', 'price', 'timestamp']].copy()
+            display_df['timestamp'] = display_df['timestamp'].astype(str).str[:19]
+        
         st.dataframe(display_df, use_container_width=True)
     
     else:
@@ -304,7 +411,11 @@ def render_home_page(db):
 def render_upload_page(db):
     """Render the upload images page"""
     st.title("📤 Multi-Image Hash Calculator")
-    st.markdown("Upload multiple images of the same item with a shared price. Images will be compressed to thumbnails and stored in Firestore.")
+    st.markdown("""
+    Upload multiple images of the same item with a shared price. Images will be compressed to thumbnails and stored in Firestore.
+    
+    **🔍 Duplicate Detection**: If an image already exists in the database, its price will be updated instead of creating a duplicate.
+    """)
     
     # Initialize session state
     if 'uploader_counter' not in st.session_state:
@@ -323,7 +434,7 @@ def render_upload_page(db):
         uploaded_files = st.file_uploader(
             "Choose image files",
             type=['png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff'],
-            help="Images will be compressed to 150x150 thumbnails",
+            help="Images will be compressed to 150x150 thumbnails. Duplicates will have their prices updated.",
             accept_multiple_files=True,
             key=uploader_key
         )
@@ -333,7 +444,7 @@ def render_upload_page(db):
             min_value=0,
             step=100,
             format="%d",
-            help="This price will be applied to all uploaded images",
+            help="This price will be applied to all uploaded images or used to update existing duplicates",
             value=st.session_state.price_value,
             key=f"price_input_{st.session_state.uploader_counter}"
         )
@@ -382,15 +493,30 @@ def render_upload_page(db):
     if process_button and uploaded_files:
         with st.spinner(f"Processing {len(uploaded_files)} images..."):
             try:
-                results, errors = process_multiple_images(uploaded_files, price, db)
+                results, errors, duplicates_updated = process_multiple_images(uploaded_files, price, db)
                 
                 if errors:
                     st.error("Some errors occurred:")
                     for error in errors:
                         st.error(f"• {error}")
                 
+                # Show duplicate updates
+                if duplicates_updated:
+                    st.warning(f"🔄 {len(duplicates_updated)} duplicate image(s) found and updated!")
+                    
+                    with st.expander("View Updated Duplicates", expanded=True):
+                        for dup in duplicates_updated:
+                            st.markdown(f"""
+                            **File:** {dup['file_name']}  
+                            **Original File:** {dup['original_filename']}  
+                            **Price Updated:** £{dup['old_price']:.2f} → £{dup['new_price']:.2f}  
+                            **Document ID:** {dup['doc_id']}
+                            """)
+                            st.markdown("---")
+                
+                # Show new images
                 if results:
-                    st.success(f"✅ {len(results)} images processed and saved to Firestore!")
+                    st.success(f"✅ {len(results)} new image(s) processed and saved to Firestore!")
                     
                     # Display results
                     if len(results) > 1:
@@ -412,6 +538,9 @@ def render_upload_page(db):
                                 with hash_col3:
                                     st.metric("wHash", result['whash'])
                                 
+                                # Display cryptographic hash
+                                st.code(f"Crypto Hash: {result['crypto_hash']}", language="text")
+                                
                                 st.info(f"Saved to Firestore with ID: {result['doc_id']}")
                     else:
                         # Single image
@@ -426,7 +555,22 @@ def render_upload_page(db):
                         with hash_col3:
                             st.metric("wHash", result['whash'])
                         
+                        # Display cryptographic hash
+                        st.code(f"Crypto Hash: {result['crypto_hash']}", language="text")
+                        
                         st.info(f"Saved to Firestore with ID: {result['doc_id']}")
+                
+                # Show summary
+                if results or duplicates_updated:
+                    st.subheader("📊 Processing Summary")
+                    summary_col1, summary_col2, summary_col3 = st.columns(3)
+                    
+                    with summary_col1:
+                        st.metric("New Images", len(results))
+                    with summary_col2:
+                        st.metric("Duplicates Updated", len(duplicates_updated))
+                    with summary_col3:
+                        st.metric("Total Processed", len(results) + len(duplicates_updated))
                     
                     # Clear after success
                     st.session_state.uploader_counter += 1
@@ -451,11 +595,19 @@ def render_upload_page(db):
             avg_price = df['price'].mean()
             st.metric("Average Price", f"£{avg_price:.2f}")
         with col3:
-            unique_prices = df['price'].nunique()
-            st.metric("Unique Prices", unique_prices)
+            if 'crypto_hash' in df.columns:
+                unique_images = df['crypto_hash'].nunique()
+                st.metric("Unique Images", unique_images)
+            else:
+                unique_prices = df['price'].nunique()
+                st.metric("Unique Prices", unique_prices)
         with col4:
-            latest_entry = str(df['timestamp'].max())[:19]
-            st.metric("Latest Entry", latest_entry)
+            if 'last_updated' in df.columns:
+                latest_entry = str(df['last_updated'].max())[:19]
+                st.metric("Latest Update", latest_entry)
+            else:
+                latest_entry = str(df['timestamp'].max())[:19]
+                st.metric("Latest Entry", latest_entry)
     else:
         st.info("No records in database yet. Upload images to get started!")
 
@@ -532,9 +684,24 @@ def render_search_page(db):
                 # Calculate hashes
                 query_phash, query_dhash, query_whash = calculate_hashes(query_image)
                 
+                # Also calculate crypto hash for exact duplicate detection
+                query_image_bytes = image_to_bytes(query_image)
+                query_crypto_hash = calculate_cryptographic_hash(query_image_bytes)
+                
                 if not all([query_phash, query_dhash, query_whash]):
                     st.error("Failed to calculate hashes for query image")
                     return
+                
+                # Check for exact duplicate first
+                existing_doc, existing_doc_id = check_duplicate_image(db, query_crypto_hash)
+                if existing_doc:
+                    st.success("🎯 Exact duplicate found!")
+                    st.markdown(f"""
+                    **Original File:** {existing_doc.get('original_filename', 'Unknown')}  
+                    **Price:** £{existing_doc.get('price', 0):.2f}  
+                    **Document ID:** {existing_doc_id}
+                    """)
+                    st.markdown("---")
                 
                 # Display query hashes
                 st.subheader("Query Image Hashes")
@@ -545,6 +712,9 @@ def render_search_page(db):
                     st.metric("dHash", query_dhash)
                 with hash_col3:
                     st.metric("wHash", query_whash)
+                
+                # Display crypto hash
+                st.code(f"Crypto Hash: {query_crypto_hash}", language="text")
                 
                 # Find similar images
                 similarities = find_similar_images(query_phash, query_dhash, query_whash, df, num_results)
@@ -572,7 +742,13 @@ def render_search_page(db):
                                 st.markdown(f"**Filename:** {sim['original_filename']}")
                                 st.markdown(f"**Price:** £{sim['price']:.2f}")
                                 st.markdown(f"**Timestamp:** {str(sim['timestamp'])[:19]}")
+                                if 'last_updated' in sim:
+                                    st.markdown(f"**Last Updated:** {str(sim['last_updated'])[:19]}")
                                 st.markdown(f"**Distance:** {sim['avg_distance']:.2f}")
+                                
+                                # Show if it's an exact duplicate
+                                if sim['crypto_hash'] == query_crypto_hash:
+                                    st.success("🎯 Exact Duplicate!")
                                 
                                 # Hash distances
                                 st.markdown("**Hash Distances:**")
@@ -583,6 +759,10 @@ def render_search_page(db):
                                     st.metric("dHash", f"{sim['dhash_distance']}")
                                 with distance_col3:
                                     st.metric("wHash", f"{sim['whash_distance']}")
+                                
+                                # Show crypto hash
+                                with st.expander("Show Crypto Hash"):
+                                    st.code(sim['crypto_hash'], language="text")
                                 
                                 # Similarity percentage
                                 max_distance = 64
@@ -607,6 +787,11 @@ def render_search_page(db):
                     with summary_col4:
                         avg_price = sum(sim['price'] for sim in similarities) / len(similarities)
                         st.metric("Avg Price", f"£{avg_price:.2f}")
+                    
+                    # Check for exact duplicates in results
+                    exact_duplicates = [sim for sim in similarities if sim['crypto_hash'] == query_crypto_hash]
+                    if exact_duplicates:
+                        st.info(f"🔍 Found {len(exact_duplicates)} exact duplicate(s) in results")
                     
                 else:
                     st.info("No similar images found.")
