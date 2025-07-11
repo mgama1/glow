@@ -59,7 +59,7 @@ def init_firebase():
         firebase_admin.initialize_app(cred)
         return firestore.client()
 
-def compress_image_to_base64(image, max_size=150, quality=85):
+def compress_image_to_base64(image, max_size=256, quality=95):
     """Compress image and convert to base64"""
     # Create a copy to avoid modifying original
     img = image.copy()
