@@ -316,17 +316,10 @@ def render_home_page(db):
     st.title("GLOW STORE")
     
     st.markdown("""
-    Welcome to the **GLOW STORE** Reverse image search! This tool allows you to upload multiple images, calculate their perceptual hashes, and store them in Firestore for easy retrieval and comparison.
+    Welcome to the **GLOW STORE** Reverse image search! This tool allows you to upload multiple images and store them for easy retrieval and comparison.
     """)
     
-    st.markdown(
-        """
-        <div style="display: flex; justify-content: center;">
-            <img src="https://scontent.fcai20-1.fna.fbcdn.net/v/t39.30808-6/499123096_1874969766690568_8210053830202425729_n.jpg?_nc_cat=108&ccb=1-7&_nc_sid=6ee11a&_nc_ohc=4ZIhfZ6tSG8Q7kNvwGnHGtH&_nc_oc=Adlx7UpxLzhvaMZ1vTDZj8qCO0t-n2VvM-7uH1FvnsooWeJNig_hYV9vRopSXXuSRm8&_nc_zt=23&_nc_ht=scontent.fcai20-1.fna&_nc_gid=WvmBtWo4pUlhj2vT7qumZA&oh=00_AfTT7zjxtIDWlPNX8R3aReVrTUV0HR2NE09FL3ckyFVp7Q&oe=6870D77E" style="max-width: 50%; height: auto;">
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    
 
     # Quick stats
     df = load_from_firestore(db)
