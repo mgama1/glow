@@ -501,6 +501,7 @@ def render_upload_page(db):
                         st.code(f"MD5: {result['md5_hash']}", language="text")
                     
                     # Clear after success
+                if results or updates:
                     st.session_state.uploader_counter += 1
                     st.session_state.price_value = 0
                     st.rerun()
