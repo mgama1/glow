@@ -445,33 +445,72 @@ def render_upload_page(db):
     
     # Process images
     if process_button and uploaded_files:
-        with st.spinner(f"Processing {len(uploaded_files)} images."):
+        with st.spinner(f"Processing {len(uploaded_files)} images..."):
             try:
                 results, updates, errors = process_multiple_images(uploaded_files, price, db)
-
+                
                 if errors:
                     st.error("Some errors occurred:")
                     for error in errors:
                         st.error(f"• {error}")
-
+                
                 if updates:
                     st.warning(f"⚠️ {len(updates)} duplicate images were updated with new data:")
                     for update in updates:
-                        st.info(f"• {update['file_name']} (MD5: {update['md5_hash'][:8]})")
-
-                if results:
-                    st.success(f"✅ {len(results)} new images processed and saved to Firestore!")
-                    …  # your display logic here
-
-                # ← Reset on _any_ processing, not just new results
-                if updates or results:
+                        st.info(f"• {update['file_name']} (MD5: {update['md5_hash'][:8]}...)")
+                     # Clear after success
                     st.session_state.uploader_counter += 1
                     st.session_state.price_value = 0
                     st.rerun()
-
+                
+                if results:
+                    st.success(f"✅ {len(results)} new images processed and saved to Firestore!")
+                    
+                    # Display results
+                    if len(results) > 1:
+                        tabs = st.tabs([f"Image {i+1}" for i in range(len(results))])
+                        
+                        for i, (tab, result) in enumerate(zip(tabs, results)):
+                            with tab:
+                                st.subheader(f"Results for {result['file_name']}")
+                                
+                                # Display the image
+                                st.image(result['image'], caption=result['file_name'], width=300)
+                                
+                                # Display hashes
+                                hash_col1, hash_col2, hash_col3 = st.columns(3)
+                                with hash_col1:
+                                    st.metric("pHash", result['phash'])
+                                with hash_col2:
+                                    st.metric("dHash", result['dhash'])
+                                with hash_col3:
+                                    st.metric("wHash", result['whash'])
+                                
+                                st.info(f"Saved to Firestore with ID: {result['doc_id']}")
+                                st.code(f"MD5: {result['md5_hash']}", language="text")
+                    else:
+                        # Single image
+                        result = results[0]
+                        st.subheader("Calculated Hashes")
+                        hash_col1, hash_col2, hash_col3 = st.columns(3)
+                        
+                        with hash_col1:
+                            st.metric("pHash", result['phash'])
+                        with hash_col2:
+                            st.metric("dHash", result['dhash'])
+                        with hash_col3:
+                            st.metric("wHash", result['whash'])
+                        
+                        st.info(f"Saved to Firestore with ID: {result['doc_id']}")
+                        st.code(f"MD5: {result['md5_hash']}", language="text")
+                    
+                    # Clear after success
+                    st.session_state.uploader_counter += 1
+                    st.session_state.price_value = 0
+                    st.rerun()
+                
             except Exception as e:
                 st.error(f"Error processing images: {str(e)}")
-
     
     elif process_button and not uploaded_files:
         st.warning("Please upload at least one image first!")
